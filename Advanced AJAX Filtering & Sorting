@@ -1,0 +1,683 @@
+/**
+ * ==========================================================================
+ * Advanced AJAX Filtering & Sorting for Elementor Loop Grid (WooCommerce)
+ * ALL-IN-ONE VERSION — Code Snippets / WPCode plugin ke liye
+ * ==========================================================================
+ * ISKO KAISE USE KARNA HAI:
+ * 1. Code Snippets (ya WPCode) plugin me jao -> Add New
+ * 2. Type = "PHP Snippet"
+ * 3. Neeche ka POORA code paste kar do (opening <?php tag ke saath)
+ * 4. Location/Insertion = "Run Everywhere" (WPCode) ya bas "Run Snippet
+ *    Everywhere" checkbox (Code Snippets) select karo
+ * 5. Save + Activate
+ * 6. Elementor page par Loop Grid ke UPAR ek Shortcode widget daalo:
+ *    [alf_filters]
+ * 7. Neeche STEP 0 me apna Loop Item Template ID daalna na bhoolna.
+ * ==========================================================================
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/**
+ * -----------------------------------------------------------------------
+ * STEP 0: CONFIG — ye 2 cheezein zaroor check/update karo
+ * -----------------------------------------------------------------------
+ */
+// Apna Elementor "Loop Item" Template ID yahan daalo
+// (Templates > Saved Templates > us template ko edit karo, URL me post=XXXX)
+define( 'ALF_LOOP_TEMPLATE_ID', 288 );
+
+// Ye wo container hai jispar tumhare Loop Item template mein
+// background-image (product photo) laga hua hai. Agar tumne template
+// dobara edit kiya aur ye element ID badal gaya, to yahan update karo.
+// (Elementor editor me us image/container widget ko select karke
+// right-click > "Copy Element ID" se naya ID mil jayega.)
+define( 'ALF_LOOP_BG_ELEMENT_CLASS', 'elementor-element-2ff3ce2' );
+
+function alf_get_filter_taxonomies() {
+	return array(
+		'category' => 'product_cat',
+		'color'    => 'product_color',
+		'material' => 'product_material',
+	);
+}
+
+/**
+ * -----------------------------------------------------------------------
+ * STEP 1: Price bounds helper
+ * -----------------------------------------------------------------------
+ */
+function alf_get_price_bounds() {
+	global $wpdb;
+	$result = $wpdb->get_row( "
+		SELECT MIN(CAST(meta_value AS DECIMAL(10,2))) as min_price,
+		       MAX(CAST(meta_value AS DECIMAL(10,2))) as max_price
+		FROM {$wpdb->postmeta}
+		WHERE meta_key = '_price' AND meta_value != ''
+	" );
+
+	return array(
+		'min' => $result && $result->min_price ? floor( $result->min_price ) : 0,
+		'max' => $result && $result->max_price ? ceil( $result->max_price ) : 10000,
+	);
+}
+
+/**
+ * Total published product count — used for the initial "Showing X of Y
+ * items" text before any filter has run.
+ */
+function alf_get_total_products_count() {
+	$counts = wp_count_posts( 'product' );
+	return isset( $counts->publish ) ? (int) $counts->publish : 0;
+}
+
+/**
+ * -----------------------------------------------------------------------
+ * STEP 2: AJAX Handler — core filtering/sorting logic (AND across
+ * taxonomies, OR within same taxonomy, + price range + sort)
+ * -----------------------------------------------------------------------
+ */
+add_action( 'wp_ajax_alf_filter_products', 'alf_filter_products_callback' );
+add_action( 'wp_ajax_nopriv_alf_filter_products', 'alf_filter_products_callback' );
+
+function alf_filter_products_callback() {
+
+	check_ajax_referer( 'alf_filter_nonce', 'nonce' );
+
+	$taxonomies = alf_get_filter_taxonomies();
+
+	$selected_cats      = isset( $_POST['category'] ) ? array_map( 'sanitize_text_field', (array) $_POST['category'] ) : array();
+	$selected_colors    = isset( $_POST['color'] )    ? array_map( 'sanitize_text_field', (array) $_POST['color'] )    : array();
+	$selected_materials = isset( $_POST['material'] ) ? array_map( 'sanitize_text_field', (array) $_POST['material'] ) : array();
+	$min_price          = isset( $_POST['min_price'] ) ? floatval( $_POST['min_price'] ) : '';
+	$max_price          = isset( $_POST['max_price'] ) ? floatval( $_POST['max_price'] ) : '';
+	$orderby_raw        = isset( $_POST['orderby'] ) ? sanitize_text_field( $_POST['orderby'] ) : 'menu_order';
+	$paged              = isset( $_POST['paged'] ) ? max( 1, intval( $_POST['paged'] ) ) : 1;
+	$per_page           = isset( $_POST['per_page'] ) ? intval( $_POST['per_page'] ) : 12;
+
+	$args = array(
+		'post_type'      => 'product',
+		'post_status'    => 'publish',
+		'posts_per_page' => $per_page,
+		'paged'          => $paged,
+	);
+
+	$tax_query = array( 'relation' => 'AND' );
+
+	if ( ! empty( $selected_cats ) ) {
+		$tax_query[] = array(
+			'taxonomy' => $taxonomies['category'],
+			'field'    => 'slug',
+			'terms'    => $selected_cats,
+			'operator' => 'IN',
+		);
+	}
+	if ( ! empty( $selected_colors ) ) {
+		$tax_query[] = array(
+			'taxonomy' => $taxonomies['color'],
+			'field'    => 'slug',
+			'terms'    => $selected_colors,
+			'operator' => 'IN',
+		);
+	}
+	if ( ! empty( $selected_materials ) ) {
+		$tax_query[] = array(
+			'taxonomy' => $taxonomies['material'],
+			'field'    => 'slug',
+			'terms'    => $selected_materials,
+			'operator' => 'IN',
+		);
+	}
+	if ( count( $tax_query ) > 1 ) {
+		$args['tax_query'] = $tax_query;
+	}
+
+	if ( $min_price !== '' && $max_price !== '' ) {
+		$args['meta_query'] = array(
+			array(
+				'key'     => '_price',
+				'value'   => array( $min_price, $max_price ),
+				'compare' => 'BETWEEN',
+				'type'    => 'NUMERIC',
+			),
+		);
+	}
+
+	switch ( $orderby_raw ) {
+		case 'price-asc':
+			$args['orderby']  = 'meta_value_num';
+			$args['meta_key'] = '_price';
+			$args['order']    = 'ASC';
+			break;
+		case 'price-desc':
+			$args['orderby']  = 'meta_value_num';
+			$args['meta_key'] = '_price';
+			$args['order']    = 'DESC';
+			break;
+		case 'popularity':
+			$args['orderby']  = 'meta_value_num';
+			$args['meta_key'] = 'total_sales';
+			$args['order']    = 'DESC';
+			break;
+		case 'rating':
+			$args['orderby']  = 'meta_value_num';
+			$args['meta_key'] = '_wc_average_rating';
+			$args['order']    = 'DESC';
+			break;
+		case 'date':
+			$args['orderby'] = 'date';
+			$args['order']   = 'DESC';
+			break;
+		case 'title':
+			$args['orderby'] = 'title';
+			$args['order']   = 'ASC';
+			break;
+		default:
+			$args['orderby'] = 'menu_order date';
+			$args['order']   = 'ASC';
+			break;
+	}
+
+	$args = apply_filters( 'alf_query_args', $args );
+
+	$query = new WP_Query( $args );
+
+	ob_start();
+
+	if ( $query->have_posts() ) {
+		while ( $query->have_posts() ) {
+			$query->the_post();
+			alf_render_single_item();
+		}
+		wp_reset_postdata();
+	} else {
+		echo '<div class="alf-no-products">No products found for this filter combination.</div>';
+	}
+
+	$html = ob_get_clean();
+
+	wp_send_json_success( array(
+		'html'        => $html,
+		'found_posts' => $query->found_posts,
+		'post_count'  => $query->post_count,
+		'max_pages'   => $query->max_num_pages,
+		'paged'       => $paged,
+	) );
+}
+
+function alf_render_single_item() {
+	if ( ALF_LOOP_TEMPLATE_ID && class_exists( '\Elementor\Plugin' ) ) {
+
+		// $with_css = false: sirf per-widget STATIC CSS (colors, margins,
+		// fonts) hota hai, jo already page load par ek baar globally load
+		// ho chuka hota hai — dobara include karne se sirf response bhaari
+		// hota hai, kuch fayda nahi.
+		echo \Elementor\Plugin::instance()->frontend->get_builder_content_for_display( ALF_LOOP_TEMPLATE_ID, false );
+
+		// Background-image (product photo) Elementor apne internal
+		// per-post "dynamic CSS" mechanism se generate karta hai jo sirf
+		// widget ke NATIVE render flow me chalta hai — get_builder_content_for_display()
+		// se ye include nahi hoti. Isliye hum ise khud, seedha product ki
+		// featured image se, regenerate kar rahe hain — bilkul usi
+		// selector ko target karke jo Elementor khud use karta hai.
+		$img_url = get_the_post_thumbnail_url( get_the_ID(), 'large' );
+		if ( $img_url ) {
+			printf(
+				'<style>.e-loop-item-%d .elementor-element.%s{background-image:url(%s) !important;}</style>',
+				get_the_ID(),
+				esc_attr( ALF_LOOP_BG_ELEMENT_CLASS ),
+				esc_url( $img_url )
+			);
+		}
+		return;
+	}
+	wc_get_template_part( 'content', 'product' );
+}
+
+/**
+ * -----------------------------------------------------------------------
+ * STEP 3: Shortcode [alf_filters] — filter UI
+ * -----------------------------------------------------------------------
+ */
+/**
+ * Renders ONE filter group's checkbox list (used for both the desktop
+ * dropdown version AND the mobile drawer version, so both stay in sync).
+ */
+function alf_render_checkbox_group( $taxonomy_slug, $field_name ) {
+	$terms = get_terms( array( 'taxonomy' => $taxonomy_slug, 'hide_empty' => true ) );
+	if ( is_wp_error( $terms ) ) return;
+	foreach ( $terms as $term ) : ?>
+		<label class="alf-checkbox">
+			<input type="checkbox" name="<?php echo esc_attr( $field_name ); ?>" value="<?php echo esc_attr( $term->slug ); ?>">
+			<span><?php echo esc_html( $term->name ); ?></span>
+		</label>
+	<?php endforeach;
+}
+
+function alf_sort_options_html() {
+	return array(
+		'menu_order' => 'Featured',
+		'date'       => 'Newest',
+		'price-asc'  => 'Price: Low to High',
+		'price-desc' => 'Price: High to Low',
+		'popularity' => 'Popularity',
+		'rating'     => 'Average Rating',
+		'title'      => 'Name: A-Z',
+	);
+}
+
+function alf_filters_shortcode() {
+
+	$taxonomies   = alf_get_filter_taxonomies();
+	$bounds       = alf_get_price_bounds();
+	$sort_options = alf_sort_options_html();
+
+	ob_start();
+	?>
+	<div class="alf-filter-wrapper" id="alf-filter-wrapper">
+
+		<div class="alf-filter-bar">
+
+			<!-- Desktop inline dropdowns (hidden on mobile) -->
+			<div class="alf-left-filters">
+
+				<div class="alf-dropdown" data-filter="category">
+					<button type="button" class="alf-dropdown-toggle">Category <?php echo alf_chevron_svg(); ?></button>
+					<div class="alf-dropdown-panel">
+						<?php alf_render_checkbox_group( $taxonomies['category'], 'category' ); ?>
+					</div>
+				</div>
+
+				<div class="alf-dropdown" data-filter="color">
+					<button type="button" class="alf-dropdown-toggle">Colour <?php echo alf_chevron_svg(); ?></button>
+					<div class="alf-dropdown-panel">
+						<?php alf_render_checkbox_group( $taxonomies['color'], 'color' ); ?>
+					</div>
+				</div>
+
+				<div class="alf-dropdown" data-filter="material">
+					<button type="button" class="alf-dropdown-toggle">Material <?php echo alf_chevron_svg(); ?></button>
+					<div class="alf-dropdown-panel">
+						<?php alf_render_checkbox_group( $taxonomies['material'], 'material' ); ?>
+					</div>
+				</div>
+
+				<div class="alf-dropdown" data-filter="price">
+					<button type="button" class="alf-dropdown-toggle">Price <?php echo alf_chevron_svg(); ?></button>
+					<div class="alf-dropdown-panel alf-price-panel">
+						<div class="alf-price-inputs">
+							<input type="number" class="alf-min-price" value="<?php echo esc_attr( $bounds['min'] ); ?>" min="<?php echo esc_attr( $bounds['min'] ); ?>" max="<?php echo esc_attr( $bounds['max'] ); ?>">
+							<span>—</span>
+							<input type="number" class="alf-max-price" value="<?php echo esc_attr( $bounds['max'] ); ?>" min="<?php echo esc_attr( $bounds['min'] ); ?>" max="<?php echo esc_attr( $bounds['max'] ); ?>">
+						</div>
+						<button type="button" class="alf-panel-apply">Apply</button>
+					</div>
+				</div>
+
+			</div>
+
+			<div class="alf-right-controls">
+
+				<button type="button" class="alf-all-filters-btn" id="alf-open-drawer">
+					<?php echo alf_sliders_svg(); ?> All Filters
+				</button>
+
+				<span class="alf-results-count" id="alf-results-count">Showing…</span>
+
+				<div class="alf-dropdown alf-sort-dropdown" data-filter="sort">
+					<button type="button" class="alf-dropdown-toggle">Sort by: <span id="alf-sort-label"><?php echo esc_html( $sort_options['menu_order'] ); ?></span> <?php echo alf_chevron_svg(); ?></button>
+					<div class="alf-dropdown-panel alf-sort-panel">
+						<ul>
+							<?php foreach ( $sort_options as $value => $label ) : ?>
+								<li data-value="<?php echo esc_attr( $value ); ?>" class="<?php echo $value === 'menu_order' ? 'is-active' : ''; ?>"><?php echo esc_html( $label ); ?></li>
+							<?php endforeach; ?>
+						</ul>
+					</div>
+				</div>
+
+			</div>
+
+		</div>
+
+		<!-- Hidden master orderby value, kept in sync by JS -->
+		<input type="hidden" id="alf-orderby" value="menu_order">
+
+		<!-- Mobile full-screen drawer: shows ALL filters together -->
+		<div class="alf-drawer-overlay" id="alf-drawer-overlay"></div>
+		<div class="alf-mobile-drawer" id="alf-mobile-drawer">
+			<div class="alf-mobile-drawer-header">
+				<span>Filters</span>
+				<button type="button" id="alf-close-drawer" aria-label="Close">&times;</button>
+			</div>
+			<div class="alf-mobile-drawer-body">
+
+				<div class="alf-drawer-section">
+					<h4>Category</h4>
+					<div class="alf-drawer-options"><?php alf_render_checkbox_group( $taxonomies['category'], 'category' ); ?></div>
+				</div>
+
+				<div class="alf-drawer-section">
+					<h4>Colour</h4>
+					<div class="alf-drawer-options"><?php alf_render_checkbox_group( $taxonomies['color'], 'color' ); ?></div>
+				</div>
+
+				<div class="alf-drawer-section">
+					<h4>Material</h4>
+					<div class="alf-drawer-options"><?php alf_render_checkbox_group( $taxonomies['material'], 'material' ); ?></div>
+				</div>
+
+				<div class="alf-drawer-section">
+					<h4>Price</h4>
+					<div class="alf-price-inputs">
+						<input type="number" class="alf-min-price" value="<?php echo esc_attr( $bounds['min'] ); ?>" min="<?php echo esc_attr( $bounds['min'] ); ?>" max="<?php echo esc_attr( $bounds['max'] ); ?>">
+						<span>—</span>
+						<input type="number" class="alf-max-price" value="<?php echo esc_attr( $bounds['max'] ); ?>" min="<?php echo esc_attr( $bounds['min'] ); ?>" max="<?php echo esc_attr( $bounds['max'] ); ?>">
+					</div>
+				</div>
+
+				<div class="alf-drawer-section">
+					<h4>Sort By</h4>
+					<select class="alf-mobile-sort">
+						<?php foreach ( $sort_options as $value => $label ) : ?>
+							<option value="<?php echo esc_attr( $value ); ?>"><?php echo esc_html( $label ); ?></option>
+						<?php endforeach; ?>
+					</select>
+				</div>
+
+			</div>
+			<div class="alf-mobile-drawer-footer">
+				<button type="button" id="alf-mobile-clear" class="alf-clear-btn">Clear All</button>
+				<button type="button" id="alf-mobile-apply" class="alf-apply-btn">Apply Filters</button>
+			</div>
+		</div>
+
+	</div>
+	<?php
+	return ob_get_clean();
+}
+add_shortcode( 'alf_filters', 'alf_filters_shortcode' );
+
+function alf_chevron_svg() {
+	return '<svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg" class="alf-chevron"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+
+function alf_sliders_svg() {
+	return '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="6" cy="4" r="1.5" fill="#fff" stroke="currentColor" stroke-width="1.2"/><circle cx="11" cy="8" r="1.5" fill="#fff" stroke="currentColor" stroke-width="1.2"/><circle cx="5" cy="12" r="1.5" fill="#fff" stroke="currentColor" stroke-width="1.2"/></svg>';
+}
+
+/**
+ * -----------------------------------------------------------------------
+ * STEP 4: Inline JS + CSS — wp_footer me print hota hai
+ * -----------------------------------------------------------------------
+ * File upload ki zaroorat nahi — sab kuch yahin se load hota hai.
+ * jQuery already WordPress core me available hota hai, isliye alag se
+ * enqueue nahi karna pad raha (bas dependency ensure kar rahe hain).
+ */
+function alf_enqueue_inline_assets() {
+	if ( is_admin() ) return;
+	wp_enqueue_script( 'jquery' );
+}
+add_action( 'wp_enqueue_scripts', 'alf_enqueue_inline_assets' );
+
+function alf_print_inline_js_css() {
+	if ( is_admin() ) return;
+	$bounds       = alf_get_price_bounds();
+	$total_count  = alf_get_total_products_count();
+	?>
+	<style>
+	/* ---------- Filter bar (desktop) ---------- */
+	.alf-filter-wrapper{font-family:inherit;}
+	.alf-filter-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;padding:18px 24px;background:#f3ede4;margin-bottom:24px;}
+	.alf-left-filters{display:flex;align-items:center;gap:28px;flex-wrap:wrap;}
+	.alf-right-controls{display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-left:auto;}
+
+	.alf-dropdown{position:relative;}
+	.alf-dropdown-toggle{display:flex;align-items:center;gap:6px;background:none;border:none;font-size:14px;color:#2b2320;cursor:pointer;padding:4px 0;font-family:inherit;}
+	.alf-chevron{transition:transform .2s ease;flex-shrink:0;}
+	.alf-dropdown.is-open .alf-chevron{transform:rotate(180deg);}
+
+	.alf-dropdown-panel{display:none;position:absolute;top:calc(100% + 10px);left:0;background:#fff;box-shadow:0 8px 24px rgba(0,0,0,.12);border-radius:6px;padding:16px;min-width:200px;z-index:50;}
+	.alf-dropdown.is-open .alf-dropdown-panel{display:block;}
+
+	.alf-checkbox{display:flex;align-items:center;gap:8px;font-size:14px;margin-bottom:10px;cursor:pointer;white-space:nowrap;}
+	.alf-checkbox:last-child{margin-bottom:0;}
+	.alf-checkbox input{margin:0;width:15px;height:15px;cursor:pointer;}
+
+	.alf-price-panel .alf-price-inputs{display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+	.alf-price-inputs input[type="number"]{width:70px;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;}
+	.alf-panel-apply,.alf-apply-btn{background:#3c1e1e;color:#fff;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-size:13px;width:100%;}
+	.alf-panel-apply:hover,.alf-apply-btn:hover{background:#552b2b;}
+
+	.alf-all-filters-btn{display:flex;align-items:center;gap:6px;background:none;border:none;font-size:14px;color:#2b2320;cursor:pointer;font-family:inherit;}
+	.alf-results-count{font-size:18px;color:#111111;white-space:nowrap;}
+
+	.alf-sort-panel{right:0;left:auto;min-width:200px;padding:8px;}
+	.alf-sort-panel ul{list-style:none;margin:0;padding:0;}
+	.alf-sort-panel li{padding:8px 10px;font-size:14px;border-radius:4px;cursor:pointer;white-space:nowrap;}
+	.alf-sort-panel li:hover,.alf-sort-panel li.is-active{background:#f3ede4;}
+
+	/* ---------- Mobile drawer ---------- */
+	.alf-drawer-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:99;}
+	.alf-drawer-overlay.is-open{display:block;}
+	.alf-mobile-drawer{position:fixed;top:0;right:-100%;width:85%;max-width:360px;height:100%;background:#fff;z-index:100;transition:right .25s ease;display:flex;flex-direction:column;}
+	.alf-mobile-drawer.is-open{right:0;}
+	.alf-mobile-drawer-header{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid #eee;font-weight:600;font-size:15px;}
+	.alf-mobile-drawer-header button{background:none;border:none;font-size:22px;line-height:1;cursor:pointer;color:#333;}
+	.alf-mobile-drawer-body{flex:1;overflow-y:auto;padding:16px 20px;}
+	.alf-drawer-section{margin-bottom:22px;}
+	.alf-drawer-section h4{margin:0 0 10px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;color:#333;}
+	.alf-drawer-options{display:flex;flex-direction:column;}
+	.alf-drawer-section .alf-price-inputs{margin-bottom:0;}
+	.alf-mobile-sort{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:4px;font-size:14px;}
+	.alf-mobile-drawer-footer{display:flex;gap:10px;padding:16px 20px;border-top:1px solid #eee;}
+	.alf-clear-btn{flex:1;background:#eee;border:none;padding:10px 16px;border-radius:4px;cursor:pointer;font-size:13px;}
+	.alf-clear-btn:hover{background:#ddd;}
+	.alf-mobile-drawer-footer .alf-apply-btn{flex:2;}
+
+	/* Below 900px: hide inline dropdowns, only "All Filters" + count + sort stay */
+	@media (max-width:900px){
+		.alf-left-filters{display:none;}
+		.alf-filter-bar{padding:0px 16px;gap:10px;}
+		.alf-right-controls{gap:14px;width:100%;justify-content:space-between;}
+		.alf-sort-dropdown .alf-dropdown-panel{right:0;left:auto;}
+	}
+	@media (max-width:480px){
+		.alf-all-filters-btn span{display:none;}
+		.alf-results-count{display:none;}
+	}
+
+	/* ---------- Loading state on the grid ---------- */
+	.elementor-loop-container.alf-loading{position:relative;min-height:200px;opacity:.4;pointer-events:none;transition:opacity .2s ease;}
+	.elementor-loop-container.alf-loading::after{content:"";position:absolute;top:50%;left:50%;width:36px;height:36px;margin:-18px 0 0 -18px;border:3px solid #ccc;border-top-color:#333;border-radius:50%;animation:alf-spin .7s linear infinite;}
+	@keyframes alf-spin{to{transform:rotate(360deg);}}
+	.alf-no-products,.alf-error{width:100%;text-align:center;padding:40px 0;color:#777;}
+	</style>
+
+	<script>
+	( function ( $ ) {
+		'use strict';
+
+		var ALF_Vars = {
+			ajax_url: <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>,
+			nonce: <?php echo wp_json_encode( wp_create_nonce( 'alf_filter_nonce' ) ); ?>,
+			minPrice: <?php echo wp_json_encode( $bounds['min'] ); ?>,
+			maxPrice: <?php echo wp_json_encode( $bounds['max'] ); ?>,
+			totalCount: <?php echo wp_json_encode( $total_count ); ?>
+		};
+
+		// If the page has more than one Loop Grid, replace this selector
+		// with that specific widget's class (elementor-element-XXXXXXX).
+		var GRID_WIDGET_SELECTOR = '.elementor-widget-loop-grid .elementor-loop-container';
+		var WRAPPER = '#alf-filter-wrapper';
+
+		var currentPage = 1;
+		var debounceTimer = null;
+
+		function $grid() {
+			return $( GRID_WIDGET_SELECTOR ).first();
+		}
+
+		// ---- Dropdown open/close ----
+		$( document ).on( 'click', '.alf-dropdown-toggle', function ( e ) {
+			e.stopPropagation();
+			var $dd = $( this ).closest( '.alf-dropdown' );
+			var wasOpen = $dd.hasClass( 'is-open' );
+			$( '.alf-dropdown' ).removeClass( 'is-open' );
+			if ( ! wasOpen ) $dd.addClass( 'is-open' );
+		} );
+		$( document ).on( 'click', function () {
+			$( '.alf-dropdown' ).removeClass( 'is-open' );
+		} );
+		$( document ).on( 'click', '.alf-dropdown-panel', function ( e ) {
+			e.stopPropagation();
+		} );
+
+		// ---- Keep desktop dropdown + mobile drawer checkboxes in sync ----
+		$( document ).on( 'change', WRAPPER + ' input[type="checkbox"]', function () {
+			var name = $( this ).attr( 'name' );
+			var value = $( this ).val();
+			var checked = $( this ).is( ':checked' );
+			$( WRAPPER + ' input[type="checkbox"][name="' + name + '"][value="' + value + '"]' ).prop( 'checked', checked );
+		} );
+		$( document ).on( 'input change', WRAPPER + ' .alf-min-price, ' + WRAPPER + ' .alf-max-price', function () {
+			var cls = $( this ).hasClass( 'alf-min-price' ) ? 'alf-min-price' : 'alf-max-price';
+			$( WRAPPER + ' .' + cls ).val( $( this ).val() );
+		} );
+
+		// ---- Sort dropdown ----
+		$( document ).on( 'click', '.alf-sort-panel li', function () {
+			var value = $( this ).data( 'value' );
+			var label = $( this ).text();
+			$( '.alf-sort-panel li' ).removeClass( 'is-active' );
+			$( this ).addClass( 'is-active' );
+			$( '#alf-sort-label' ).text( label );
+			$( '#alf-orderby' ).val( value );
+			$( WRAPPER + ' .alf-mobile-sort' ).val( value );
+			$( '.alf-dropdown' ).removeClass( 'is-open' );
+			currentPage = 1;
+			runFilter();
+		} );
+		$( document ).on( 'change', WRAPPER + ' .alf-mobile-sort', function () {
+			var value = $( this ).val();
+			var label = $( this ).find( 'option:selected' ).text();
+			$( '#alf-orderby' ).val( value );
+			$( '#alf-sort-label' ).text( label );
+			$( '.alf-sort-panel li' ).removeClass( 'is-active' ).filter( '[data-value="' + value + '"]' ).addClass( 'is-active' );
+		} );
+
+		// ---- Mobile drawer open/close ----
+		$( document ).on( 'click', '#alf-open-drawer', function () {
+			$( '#alf-mobile-drawer, #alf-drawer-overlay' ).addClass( 'is-open' );
+		} );
+		function closeDrawer() {
+			$( '#alf-mobile-drawer, #alf-drawer-overlay' ).removeClass( 'is-open' );
+		}
+		$( document ).on( 'click', '#alf-close-drawer, #alf-drawer-overlay', closeDrawer );
+
+		// ---- Gather + run ----
+		function gatherFilters() {
+			var data = {
+				action: 'alf_filter_products',
+				nonce: ALF_Vars.nonce,
+				category: [],
+				color: [],
+				material: [],
+				min_price: $( WRAPPER + ' .alf-min-price' ).first().val() || ALF_Vars.minPrice,
+				max_price: $( WRAPPER + ' .alf-max-price' ).first().val() || ALF_Vars.maxPrice,
+				orderby: $( '#alf-orderby' ).val() || 'menu_order',
+				paged: currentPage,
+				per_page: 12
+			};
+
+			$( WRAPPER + ' input[name="category"]:checked' ).each( function () {
+				if ( data.category.indexOf( $( this ).val() ) === -1 ) data.category.push( $( this ).val() );
+			} );
+			$( WRAPPER + ' input[name="color"]:checked' ).each( function () {
+				if ( data.color.indexOf( $( this ).val() ) === -1 ) data.color.push( $( this ).val() );
+			} );
+			$( WRAPPER + ' input[name="material"]:checked' ).each( function () {
+				if ( data.material.indexOf( $( this ).val() ) === -1 ) data.material.push( $( this ).val() );
+			} );
+
+			return data;
+		}
+
+		function updateURLParams( data ) {
+			if ( ! window.history || ! window.history.replaceState ) return;
+			var params = new URLSearchParams();
+			if ( data.category.length ) params.set( 'category', data.category.join( ',' ) );
+			if ( data.color.length ) params.set( 'color', data.color.join( ',' ) );
+			if ( data.material.length ) params.set( 'material', data.material.join( ',' ) );
+			if ( data.orderby !== 'menu_order' ) params.set( 'orderby', data.orderby );
+			var newUrl = window.location.pathname + ( params.toString() ? '?' + params.toString() : '' );
+			window.history.replaceState( {}, '', newUrl );
+		}
+
+		function runFilter() {
+			var data = gatherFilters();
+			updateURLParams( data );
+			$grid().addClass( 'alf-loading' );
+
+			$.ajax( {
+				url: ALF_Vars.ajax_url,
+				type: 'POST',
+				data: data,
+				success: function ( response ) {
+					if ( response.success ) {
+						$grid().html( response.data.html );
+						$( '#alf-results-count' ).text( 'Showing ' + response.data.post_count + ' of ' + response.data.found_posts + ' items' );
+					} else {
+						$grid().html( '<div class="alf-error">Something went wrong. Please try again.</div>' );
+					}
+				},
+				error: function () {
+					$grid().html( '<div class="alf-error">Unable to load filters. Please refresh the page.</div>' );
+				},
+				complete: function () {
+					$grid().removeClass( 'alf-loading' );
+				}
+			} );
+		}
+
+		function debouncedFilter() {
+			clearTimeout( debounceTimer );
+			debounceTimer = setTimeout( function () {
+				currentPage = 1;
+				runFilter();
+			}, 350 );
+		}
+
+		$( document ).ready( function () {
+			$( '#alf-results-count' ).text( 'Showing ' + Math.min( 12, ALF_Vars.totalCount ) + ' of ' + ALF_Vars.totalCount + ' items' );
+
+			$( document ).on( 'change', WRAPPER + ' input[type="checkbox"]', debouncedFilter );
+			$( document ).on( 'click', WRAPPER + ' .alf-panel-apply', function () {
+				$( '.alf-dropdown' ).removeClass( 'is-open' );
+				currentPage = 1;
+				runFilter();
+			} );
+
+			$( document ).on( 'click', '#alf-mobile-clear, #alf-clear-filters', function () {
+				$( WRAPPER + ' input[type="checkbox"]' ).prop( 'checked', false );
+				$( WRAPPER + ' .alf-min-price' ).val( ALF_Vars.minPrice );
+				$( WRAPPER + ' .alf-max-price' ).val( ALF_Vars.maxPrice );
+				$( '#alf-orderby' ).val( 'menu_order' );
+				$( '#alf-sort-label' ).text( 'Featured' );
+				$( '.alf-sort-panel li' ).removeClass( 'is-active' ).filter( '[data-value="menu_order"]' ).addClass( 'is-active' );
+				$( WRAPPER + ' .alf-mobile-sort' ).val( 'menu_order' );
+				currentPage = 1;
+				runFilter();
+			} );
+
+			$( document ).on( 'click', '#alf-mobile-apply', function () {
+				closeDrawer();
+				currentPage = 1;
+				runFilter();
+			} );
+		} );
+
+	} )( jQuery );
+	</script>
+	<?php
+}
+add_action( 'wp_footer', 'alf_print_inline_js_css' );
